@@ -38,9 +38,13 @@ AI General Tool is a command-line utility that empowers anyone to enrich their t
    go mod download
    ```
 
-3. Create a `.env` file with your OpenAI API key:
+3. Set up your OpenAI API key:
    ```bash
-   echo "OPENAI_API_KEY=your_api_key_here" > .env
+   # Copy the example environment file
+   cp .env.example .env
+
+   # Edit .env and replace with your actual API key
+   # Get your key from: https://platform.openai.com/api-keys
    ```
 
 4. Test the installation:

@@ -13,6 +13,10 @@ Thumbs.db
 *.swp
 *~
 
+# Project documentation/planning
+todo.md
+plan.md
+
 # Data files
 *.xlsx
 *.xls
