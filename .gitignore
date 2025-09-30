@@ -1,0 +1,51 @@
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.bak
+*.tmp
+*.swp
+*~
+
+# Data files
+*.xlsx
+*.xls
+*.csv
+*.tsv
+
+# Build artifacts
+/bin/
+/dist/
+/build/
+
+# Go specific
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+vendor/
+
+# IDE files
+.idea/
+*.iml
+.vscode/
+*.code-workspace
+
+# Logs
+*.log
+logs/
+
+# Test coverage
+*.cover
+*.coverage
+coverage.html
+coverage.txt
