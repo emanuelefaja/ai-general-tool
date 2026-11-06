@@ -15,7 +15,7 @@ Processes data files with AI to add enriched columns based on natural language i
 go run . process-data [FLAGS] <filename>
 ```
 
-**Important:** This tool requires an OpenAI API key in the .env file.
+**Important:** This tool requires an Anthropic API key in the .env file.
 
 **Flags:**
 - `-input <file>`: Input CSV or Excel file (required)
@@ -348,7 +348,7 @@ go run . process-data \
 
 The tool shows:
 - Real-time token usage
-- Estimated cost (based on GPT-4o-mini pricing)
+- Estimated cost (based on Claude Sonnet 5.5 pricing)
 - Final statistics after completion
 
 For large datasets, consider:
