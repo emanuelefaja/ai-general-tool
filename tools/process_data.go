@@ -3,7 +3,6 @@ package tools
 import (
 	"context"
 	"encoding/csv"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -14,10 +13,7 @@ import (
 	"syscall"
 	"time"
 
-
 	"github.com/joho/godotenv"
-	"github.com/openai/openai-go"
-	"github.com/openai/openai-go/option"
 	"github.com/xuri/excelize/v2"
 )
 
@@ -29,21 +25,25 @@ type ProcessingTask struct {
 
 // ProcessingResult represents the result of processing a row
 type ProcessingResult struct {
-	RowIndex int
-	RowData  map[string]string // original data
-	Results  map[string]string // new column -> value
-	Error    error
-	Tokens   int
+	RowIndex     int
+	RowData      map[string]string // original data
+	Results      map[string]string // new column -> value
+	Error        error
+	Tokens       int
+	InputTokens  int
+	OutputTokens int
 }
 
 // ProcessingStats tracks overall progress
 type ProcessingStats struct {
-	TotalRows      int
-	CompletedRows  int32
-	FailedRows     int32
-	TotalTokens    int64
-	StartTime      time.Time
-	EstimatedCost  float64
+	TotalRows     int
+	CompletedRows int32
+	FailedRows    int32
+	TotalTokens   int64
+	InputTokens   int64
+	OutputTokens  int64
+	StartTime     time.Time
+	EstimatedCost float64
 }
 
 // RunProcessData handles the process-data command
@@ -59,6 +59,11 @@ func RunProcessData(args []string) error {
 	batchSize := fs.Int("batch-size", 100, "Save progress every N rows")
 	workers := fs.Int("workers", 10, "Number of parallel workers")
 	sheetIndex := fs.Int("sheet", 1, "Excel sheet number (1-based)")
+	model := fs.String("model", "claude-sonnet-5-5", "Anthropic model ID")
+	limit := fs.Int("limit", 0, "Maximum input rows to process (0 = all)")
+	yes := fs.Bool("yes", false, "Process the selected rows without an interactive confirmation")
+	preset := fs.String("preset", "", "Optional task preset: cpd-direction")
+
 	outputFormat := fs.String("format", "same", "Output format: same, csv")
 
 	// Parse flags
@@ -72,6 +77,16 @@ func RunProcessData(args []string) error {
 	}
 
 	// Validation
+	if *preset != "" && *preset != "cpd-direction" {
+		return fmt.Errorf("unknown preset")
+	}
+	if *preset == "cpd-direction" {
+		*columns = "direction,response_kind,explanation"
+		*prompt = cpdDirectionPrompt
+	}
+	if *workers < 1 || *workers > 100 || *batchSize < 1 || *sampleSize < 0 || *limit < 0 {
+		return fmt.Errorf("workers must be 1-100, batch-size positive, and sample/limit nonnegative")
+	}
 	if *inputFile == "" {
 		return fmt.Errorf("input file is required")
 	}
@@ -87,13 +102,13 @@ func RunProcessData(args []string) error {
 		fmt.Printf("Warning: .env file not found: %v\n", err)
 	}
 
-	apiKey := os.Getenv("OPENAI_API_KEY")
+	apiKey := os.Getenv("ANTHROPIC_API_KEY")
 	if apiKey == "" {
-		return fmt.Errorf("OPENAI_API_KEY not found in environment")
+		return fmt.Errorf("ANTHROPIC_API_KEY not found in environment")
 	}
 
-	// Initialize OpenAI client
-	client := openai.NewClient(option.WithAPIKey(apiKey))
+	// Initialize Anthropic client
+	client := newAnthropicClient(apiKey, *model, *preset)
 
 	// Parse column specifications
 	columnSpecs := parseColumnSpecs(*columns)
@@ -116,19 +131,26 @@ func RunProcessData(args []string) error {
 		return fmt.Errorf("error loading input: %v", err)
 	}
 
-	fmt.Printf("Loaded %d rows with %d columns\n", len(rows), len(headers))
+	if *limit > 0 && len(rows) > *limit {
+		rows = rows[:*limit]
+	}
+	fmt.Printf("Selected %d rows with %d columns; model %s\n", len(rows), len(headers), *model)
 
 	// Test on sample first
 	fmt.Println("\n=== TESTING ON SAMPLE ===")
-	if err := testSample(&client, headers, rows, columnSpecs, *prompt, *sampleSize); err != nil {
+	if err := testSample(client, headers, rows, columnSpecs, *prompt, *sampleSize); err != nil {
 		return fmt.Errorf("sample test failed: %v", err)
 	}
 
 	// Ask for confirmation
-	fmt.Print("\nProceed with full processing? (y/n): ")
+	if !*yes {
+		fmt.Print("\nProceed with processing the selected rows? (y/n): ")
+	}
 	var response string
-	fmt.Scanln(&response)
-	if strings.ToLower(response) != "y" {
+	if !*yes {
+		fmt.Scanln(&response)
+	}
+	if !*yes && strings.ToLower(response) != "y" {
 		fmt.Println("Processing cancelled.")
 		return nil
 	}
@@ -141,16 +163,20 @@ func RunProcessData(args []string) error {
 	// Handle interrupts gracefully
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigChan)
 	go func() {
-		<-sigChan
-		fmt.Println("\n\nInterrupt received. Saving progress...")
-		cancel()
+		select {
+		case <-sigChan:
+			fmt.Println("\n\nInterrupt received. Saving progress...")
+			cancel()
+		case <-ctx.Done():
+		}
 	}()
 
 	// Process data
 	enrichedRows, stats := processFullDataset(
 		ctx,
-		&client,
+		client,
 		headers,
 		rows,
 		columnSpecs,
@@ -168,7 +194,16 @@ func RunProcessData(args []string) error {
 
 	// Print final statistics
 	printFinalStats(stats)
+	if err := saveRunManifest(*outputFile, *inputFile, *prompt, client, stats); err != nil {
+		return fmt.Errorf("saving run manifest: %w", err)
+	}
 	fmt.Printf("\nOutput saved to: %s\n", *outputFile)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if stats.FailedRows > 0 {
+		return fmt.Errorf("%d rows failed; inspect output before use", stats.FailedRows)
+	}
 
 	return nil
 }
@@ -264,7 +299,7 @@ func loadExcel(filename string, sheetIndex int) ([]string, [][]string, error) {
 }
 
 // testSample tests processing on a small sample
-func testSample(client *openai.Client, headers []string, rows [][]string, columnSpecs []ColumnSpec, userPrompt string, sampleSize int) error {
+func testSample(client *anthropicClient, headers []string, rows [][]string, columnSpecs []ColumnSpec, userPrompt string, sampleSize int) error {
 	fmt.Printf("Testing on %d sample rows...\n\n", sampleSize)
 
 	// Take sample rows
@@ -286,8 +321,7 @@ func testSample(client *openai.Client, headers []string, rows [][]string, column
 
 		result, err := processRow(context.Background(), client, rowData, columnSpecs, userPrompt)
 		if err != nil {
-			fmt.Printf("Row %d: ERROR - %v\n", i+1, err)
-			continue
+			return fmt.Errorf("sample row %d: %w", i+1, err)
 		}
 
 		fmt.Printf("Row %d:\n", i+1)
@@ -298,98 +332,15 @@ func testSample(client *openai.Client, headers []string, rows [][]string, column
 	return nil
 }
 
-// processRow processes a single row using OpenAI
-func processRow(ctx context.Context, client *openai.Client, rowData map[string]string, columnSpecs []ColumnSpec, userPrompt string) (*ProcessingResult, error) {
-	// Build the context for the AI
-	var dataContext strings.Builder
-	for key, value := range rowData {
-		if value == "" {
-			dataContext.WriteString(fmt.Sprintf("%s: [empty]\n", key))
-		} else {
-			dataContext.WriteString(fmt.Sprintf("%s: %s\n", key, value))
-		}
-	}
-
-	// Build JSON schema for structured output
-	properties := make(map[string]interface{})
-	required := make([]string, 0)
-
-	for _, spec := range columnSpecs {
-		properties[spec.Name] = map[string]interface{}{
-			"type":        "string", // For now, all strings
-			"description": fmt.Sprintf("Value for %s column", spec.Name),
-		}
-		required = append(required, spec.Name)
-	}
-
-	schema := map[string]interface{}{
-		"type":                 "object",
-		"properties":           properties,
-		"required":             required,
-		"additionalProperties": false,
-	}
-
-	// System prompt
-	systemPrompt := `You are a data processing assistant. You analyze input data and extract or generate the requested information in a structured format.
-Always return valid values for all requested fields. If a value cannot be determined, use "N/A" or an appropriate default.
-Be consistent in your formatting across all rows.`
-
-	// User message combining data and prompt
-	userMessage := fmt.Sprintf("Data:\n%s\n\nTask: %s", dataContext.String(), userPrompt)
-
-	// Call OpenAI with function calling for structured output
-	params := openai.ChatCompletionNewParams{
-		Model: openai.ChatModelGPT4oMini,
-		Messages: []openai.ChatCompletionMessageParamUnion{
-			openai.SystemMessage(systemPrompt),
-			openai.UserMessage(userMessage),
-		},
-		Functions: []openai.ChatCompletionNewParamsFunction{
-			{
-				Name:        "extract_data",
-				Description: openai.String("Extract or generate the requested data fields"),
-				Parameters:  openai.FunctionParameters(schema),
-			},
-		},
-		Temperature: openai.Float(0.3),
-		MaxTokens:   openai.Int(500),
-	}
-
-	completion, err := client.Chat.Completions.New(ctx, params)
-	if err != nil {
-		return nil, err
-	}
-
-	if len(completion.Choices) == 0 {
-		return nil, fmt.Errorf("no response from AI")
-	}
-
-	choice := completion.Choices[0]
-	if choice.Message.FunctionCall.Name == "" {
-		return nil, fmt.Errorf("no function call in response")
-	}
-
-	// Parse the function arguments
-	var results map[string]string
-	if err := json.Unmarshal([]byte(choice.Message.FunctionCall.Arguments), &results); err != nil {
-		return nil, fmt.Errorf("failed to parse AI response: %v", err)
-	}
-
-	tokens := 0
-	if completion.Usage.TotalTokens > 0 {
-		tokens = int(completion.Usage.TotalTokens)
-	}
-
-	return &ProcessingResult{
-		Results: results,
-		Tokens:  tokens,
-	}, nil
+// processRow processes one row with Anthropic structured outputs.
+func processRow(ctx context.Context, client *anthropicClient, rowData map[string]string, columnSpecs []ColumnSpec, userPrompt string) (*ProcessingResult, error) {
+	return client.process(ctx, rowData, columnSpecs, userPrompt)
 }
 
 // processFullDataset processes the entire dataset
 func processFullDataset(
 	ctx context.Context,
-	client *openai.Client,
+	client *anthropicClient,
 	headers []string,
 	rows [][]string,
 	columnSpecs []ColumnSpec,
@@ -411,7 +362,7 @@ func processFullDataset(
 	// Create enriched rows (copy of original with space for new columns)
 	enrichedRows := make([][]string, len(rows))
 	for i, row := range rows {
-		enrichedRows[i] = make([]string, len(row)+len(columnSpecs))
+		enrichedRows[i] = make([]string, len(headers)+len(columnSpecs))
 		copy(enrichedRows[i], row)
 	}
 
@@ -443,7 +394,8 @@ func processFullDataset(
 
 			select {
 			case <-ctx.Done():
-				break
+				close(taskChan)
+				return
 			case taskChan <- ProcessingTask{RowIndex: i, RowData: rowData}:
 			}
 		}
@@ -461,7 +413,7 @@ func processFullDataset(
 // processWorker is a worker goroutine
 func processWorker(
 	ctx context.Context,
-	client *openai.Client,
+	client *anthropicClient,
 	headers []string,
 	columnSpecs []ColumnSpec,
 	userPrompt string,
@@ -494,6 +446,8 @@ func processWorker(
 			} else {
 				processingResult.Results = result.Results
 				processingResult.Tokens = result.Tokens
+				processingResult.InputTokens = result.InputTokens
+				processingResult.OutputTokens = result.OutputTokens
 			}
 
 			resultChan <- processingResult
@@ -544,6 +498,8 @@ func collectResults(
 			if result.Error == nil {
 				atomic.AddInt32(&stats.CompletedRows, 1)
 				atomic.AddInt64(&stats.TotalTokens, int64(result.Tokens))
+				atomic.AddInt64(&stats.InputTokens, int64(result.InputTokens))
+				atomic.AddInt64(&stats.OutputTokens, int64(result.OutputTokens))
 			} else {
 				atomic.AddInt32(&stats.FailedRows, 1)
 			}
@@ -560,11 +516,6 @@ func collectResults(
 			// Periodic save
 			saveProgress(outputFile, headers, enrichedRows, columnSpecs, rowMutex)
 
-		case <-ctx.Done():
-			// Save on interrupt
-			saveProgress(outputFile, headers, enrichedRows, columnSpecs, rowMutex)
-			doneChan <- true
-			return
 		}
 	}
 }
@@ -658,7 +609,7 @@ func getColumnNames(specs []ColumnSpec) []string {
 func columnIndexToLetter(index int) string {
 	result := ""
 	for index >= 0 {
-		result = string('A'+index%26) + result
+		result = string(rune('A'+index%26)) + result
 		index = index/26 - 1
 	}
 	return result
@@ -685,10 +636,10 @@ func printProgress(stats *ProcessingStats) {
 	percentage := float64(completed+failed) * 100 / float64(total)
 	elapsed := time.Since(stats.StartTime)
 
-	// Estimate cost (GPT-4o-mini pricing)
-	costPerMillion := 0.15  // $0.15 per 1M input tokens
-	costPer1MOutput := 0.60 // $0.60 per 1M output tokens
-	estimatedCost := float64(tokens) / 1000000 * ((costPerMillion + costPer1MOutput) / 2)
+	// Sonnet 5.5 standard token estimate; sample calls are additional.
+	costPerMillion := 2.0   // $0.15 per 1M input tokens
+	costPer1MOutput := 10.0 // $0.60 per 1M output tokens
+	estimatedCost := (float64(atomic.LoadInt64(&stats.InputTokens))*costPerMillion + float64(atomic.LoadInt64(&stats.OutputTokens))*costPer1MOutput) / 1000000
 
 	fmt.Printf("\rProgress: %d/%d (%.1f%%) | Failed: %d | Tokens: %d | Cost: $%.4f | Elapsed: %s",
 		completed, total, percentage, failed, tokens, estimatedCost, elapsed.Round(time.Second))
@@ -702,10 +653,10 @@ func printFinalStats(stats *ProcessingStats) {
 	fmt.Printf("Total tokens used: %d\n", stats.TotalTokens)
 
 	// Calculate final cost
-	costPerMillion := 0.15
-	costPer1MOutput := 0.60
-	estimatedCost := float64(stats.TotalTokens) / 1000000 * ((costPerMillion + costPer1MOutput) / 2)
-	fmt.Printf("Estimated cost: $%.4f\n", estimatedCost)
+	costPerMillion := 2.0
+	costPer1MOutput := 10.0
+	estimatedCost := (float64(stats.InputTokens)*costPerMillion + float64(stats.OutputTokens)*costPer1MOutput) / 1000000
+	fmt.Printf("Sonnet 5.5 standard token estimate (excluding sample): $%.4f\n", estimatedCost)
 
 	elapsed := time.Since(stats.StartTime)
 	fmt.Printf("Total time: %s\n", elapsed.Round(time.Second))

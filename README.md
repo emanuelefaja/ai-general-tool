@@ -16,13 +16,13 @@ AI General Tool is a command-line utility that empowers anyone to enrich their t
 - 📊 Works with CSV and Excel files
 - ⚡ Parallel processing for large datasets
 - 💰 Cost estimation before processing
-- 🔄 Resumable if interrupted
+- 🔄 Incremental progress saves
 - ✅ Test-first approach prevents costly mistakes
 
 ## Prerequisites
 
 - Go 1.24 or higher
-- OpenAI API key
+- Anthropic API key
 - CSV or Excel files to process
 
 ## Installation
@@ -38,13 +38,13 @@ AI General Tool is a command-line utility that empowers anyone to enrich their t
    go mod download
    ```
 
-3. Set up your OpenAI API key:
+3. Set up your Anthropic API key:
    ```bash
    # Copy the example environment file
    cp .env.example .env
 
    # Edit .env and replace with your actual API key
-   # Get your key from: https://platform.openai.com/api-keys
+   # Get your key from: https://platform.claude.com/settings/keys
    ```
 
 4. Test the installation:
@@ -285,7 +285,7 @@ go run . process-data \
 
 ### Cost Management
 - **Token usage** is displayed in real-time during processing
-- **Estimated costs** shown based on GPT-4o-mini pricing
+- **Estimated costs** shown based on Claude Sonnet 5.5 pricing
 - **Test first** with small samples to refine prompts
 - **Shorter prompts** reduce token usage
 
@@ -319,13 +319,13 @@ go run . process-data \
 ### Automatic Recovery
 - Progress saves every batch (default: 100 rows)
 - Interruption with Ctrl+C saves current progress
-- Resume by checking the output file
+- Progress is saved, but automatic restart/resume is not implemented; do not rerun completed rows blindly.
 
 ### Common Issues
 
 **Missing API Key:**
 ```
-Error: OPENAI_API_KEY not found in environment
+Error: ANTHROPIC_API_KEY not found in environment
 Solution: Add key to .env file
 ```
 
@@ -346,11 +346,11 @@ Solution: Reduce -workers parameter or wait
 ### Environment Variables
 ```bash
 # Required
-OPENAI_API_KEY=your_key_here
+ANTHROPIC_API_KEY=your_key_here
 
 # Optional (future features)
-OPENAI_MODEL=gpt-4o-mini
-OPENAI_TEMPERATURE=0.3
+# Default model: claude-sonnet-5-5 (override with -model)
+# Model selection: use -model claude-sonnet-5-5
 ```
 
 ### Default Values
@@ -429,10 +429,28 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## Acknowledgments
 
-- Built with OpenAI's GPT models
+- Built with Anthropic Claude
 - Excel handling via excelize library
 - Inspired by the need for accessible AI data processing
 
 ---
 
 **Made with ❤️ for data professionals who want AI power without the complexity**
+## CPD direction classification
+
+The default provider is Anthropic Messages with `claude-sonnet-5-5` and JSON structured outputs. It uses the standard Go HTTP client with bounded workers, request timeouts and retries for transient failures. No temperature or forced tool-call parameters are sent.
+
+Prepare one row per indicator definition/context and preserve its stable indicator ID. Avoid feeding repeated yearly measurements, and keep components separate when they measure different concepts.
+
+```bash
+go run . process-data -input cpd-pilot.csv -output cpd-directions.csv \
+  -preset cpd-direction -limit 100 -workers 5 -sample 0 -yes
+```
+
+The preset returns `direction`, `response_kind`, and `explanation`. Direction is one of `HIGHER_IS_BETTER`, `LOWER_IS_BETTER`, `NOT_APPLICABLE`, or `UNCLEAR`. It does not infer the desired direction from whether an actual is above/below its target. Preserve uncertain and categorical cases for review. Inputs are data rather than instructions.
+
+`-limit` restricts the input to the first N rows; prepare a representative/shuffled pilot file first. `-sample` tests rows before the confirmation and incurs separate API calls; `-sample 0` avoids duplicate sample calls when running an already prepared pilot. `-yes` skips confirmation for the selected rows only. Without it the tool retains its interactive confirmation.
+
+The output sidecar `.run.json` records the model, prompt and input hashes, token counts and unreviewed status. It never contains the API key. Keep the output and sidecar together. Costs use Sonnet 5.5 standard pricing ($2/M input and $10/M output); the estimate is not valid if another model is selected and excludes sample calls and failed responses. Progress saves do not implement automatic resume.
+
+Spot-check a manually labelled pilot, inspect uncertain cases, and review the resulting mapping before using it in production scoring. This command never updates Performance App data.

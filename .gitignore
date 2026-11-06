@@ -53,3 +53,5 @@ logs/
 *.coverage
 coverage.html
 coverage.txt
+# AI run provenance (local input paths/prompts)
+*.run.json
